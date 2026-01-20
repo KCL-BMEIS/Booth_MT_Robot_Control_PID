@@ -3,6 +3,7 @@ import time
 import pygame
 import sys
 import random
+from simple_pid import PID
 
 #from T249 and stepmotor
 STEPS_PER_REV = 200
@@ -25,10 +26,7 @@ class MotorControlSystem:
         except Exception as e:
             print(f"Connection Failed: {e}"); sys.exit()
 
-        self.target_steps = {1: 0, 2: 0, 3: 0, 4: 0}
-        self.current_steps = {1: 0, 2: 0, 3: 0, 4: 0}
         self.selected = []
-        self.kp = 20.0  
         self.jog_speed = 1
         
         self.fine_deg = int(1.0 / DEG_PER_STEP) 
@@ -44,6 +42,27 @@ class MotorControlSystem:
         self.f_small = pygame.font.SysFont("Consolas", 16)
         self.clock = pygame.time.Clock()
 
+        # Create PID controllers for each motor
+        self.pid_controllers = {}
+        for m in range(1, 5):
+            self.pid_controllers[m] = PID(
+                Kp=20.0, # x 1000 ?
+                Ki=0.1,    # Add integral term
+                Kd=0.05,   # Add derivative term
+                setpoint=0,
+                output_limits=(-2500000, 2500000) # must be adjusted!
+            )
+    
+    def steps_to_deg(self, steps):
+        return steps * DEG_PER_STEP
+    def deg_to_steps(self, deg):
+        return int(deg / DEG_PER_STEP)
+
+    def steps_to_mm(self, steps):
+        return (steps / STEPS_PER_REV) * LEAD_PITCH
+    def mm_to_steps(self, mm):
+        return int((mm / LEAD_PITCH) * STEPS_PER_REV)
+
     def update_feedback(self):
         self.ser.reset_input_buffer() 
         self.ser.write(b"GET_ALL_POS\n")
@@ -53,18 +72,43 @@ class MotorControlSystem:
             if len(p) == 5:
                 for i in range(1, 5): self.current_steps[i] = int(p[i])
 
-    def run_p_control(self):
+    def run_PID_vel_control_in_steps(self, target_steps):
         for m in range(1, 5):
-            err = self.target_steps[m] - self.current_steps[m]
-            if abs(err) >= 1:
-                vel = int(err * self.kp * 1000)
-                vel = max(min(vel, 2500000), -2500000)
+            # Update setpoint (this happens every frame, totally fine!)
+            self.pid_controllers[m].setpoint = target_steps[m]
+            
+            # PID computes control output based on current position
+            vel = int(self.pid_controllers[m](self.current_steps[m]))
+            
+            if abs(vel) >= 1:
                 self.ser.write(f"SET_VEL {m} {vel}\n".encode())
             else:
                 self.ser.write(f"SET_VEL {m} 0\n".encode())
 
-# nothing important below, just UI stuff
-    def draw_ui(self, mode, text):
+
+
+    def run_PID_vel_control_in_degs_mm_via_Tic(self, dist_current_targets): # dist [X_mm, Y_mm, Z_mm, A_deg, B_deg_ C_deg], X = Catheter, Z = GW, Y not in use atm
+        self.update_feedback()
+        target_steps = [0, 0, 0, 0]  # X, Z, A, C
+        target_steps[0] = self.mm_to_steps(dist_current_targets[0])  # X axis in mm (front motor for cath)
+        target_steps[1] = self.mm_to_steps(dist_current_targets[2])  # Z axis in mm (back motor for GW)
+        target_steps[2] = self.deg_to_steps(dist_current_targets[3]) # A axis in deg (left rot motor)
+        target_steps[3] = self.deg_to_steps(dist_current_targets[5]) # C axis in deg (not used)
+        
+        for m in range(1, 4):
+
+            # Update setpoint (this happens every frame, totally fine!)
+            self.pid_controllers[m].setpoint = target_steps[m]
+            
+            # PID computes control output based on current position
+            vel = int(self.pid_controllers[m](self.current_steps[m]))
+            
+            if abs(vel) >= 1:
+                self.ser.write(f"SET_VEL {m} {vel}\n".encode())
+            else:
+                self.ser.write(f"SET_VEL {m} 0\n".encode())
+
+    def draw_ui(self, mode, text):# nothing important below, just UI stuff
         self.screen.fill(G_DARK)
         
         pygame.draw.rect(self.screen, G_RED, (0, 0, 1050, 60))
@@ -105,15 +149,20 @@ class MotorControlSystem:
         self.screen.blit(help_t, (70, 570))
 
         pygame.display.flip()
-
+    
     def run(self):
         in_mode, in_txt = None, ""
         for _ in range(5): self.update_feedback(); time.sleep(0.1)
-        self.target_steps = self.current_steps.copy()
+        test_targets_in_steps = {1: 100, 2: 200, 3: 50, 4: 75}
 
         while True:
+            
+            # Test 1
             self.update_feedback()
-            self.run_p_control()
+            self.run_PID_vel_control_in_steps(test_targets_in_steps)
+
+            # Test 2 (please comment out linees 161 and 162 to use this)
+            #self.run_PID_vel_control_in_degs_mm_via_Tic([self.steps_to_mm(test_targets_in_steps[1]), 0, self.steps_to_mm(test_targets_in_steps[2]), self.steps_to_deg(test_targets_in_steps[3]), 0, self.steps_to_deg(test_targets_in_steps[4])])
             
             keys = pygame.key.get_pressed()
             if not in_mode:
@@ -143,7 +192,7 @@ class MotorControlSystem:
                         if event.key == pygame.K_z:
                             for m in self.selected:
                                 self.ser.write(f"RESET_POS {m} 0\n".encode())
-                                self.target_steps[m] = 0
+                                test_targets_in_steps[m] = 0
                     else:
                         if event.key == pygame.K_RETURN:
                             try:
