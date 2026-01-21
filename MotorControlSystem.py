@@ -19,7 +19,7 @@ G_DARK   = (10, 15, 25)
 G_GRAY   = (80, 90, 110)
 
 class MotorControlSystem:
-    def __init__(self, port="COM6"):
+    def __init__(self, port="COM10"):
         try:
             self.ser = serial.Serial(port, 115200, timeout=0.01)
             time.sleep(2)
@@ -31,7 +31,8 @@ class MotorControlSystem:
         
         self.fine_deg = int(1.0 / DEG_PER_STEP) 
         self.fine_mm = int((0.1 / LEAD_PITCH) * STEPS_PER_REV)
-
+        self.current_steps = [0, 0, 0, 0]
+        '''        
         pygame.init()
         self.screen = pygame.display.set_mode((1050, 650))
         pygame.display.set_caption("MOTOR OS - UC8626")
@@ -41,14 +42,14 @@ class MotorControlSystem:
         self.f_data = pygame.font.SysFont("Consolas", 32, bold=True)
         self.f_small = pygame.font.SysFont("Consolas", 16)
         self.clock = pygame.time.Clock()
-
+        '''
         # Create PID controllers for each motor
         self.pid_controllers = {}
         for m in range(1, 5):
             self.pid_controllers[m] = PID(
-                Kp=20.0, # x 1000 ?
-                Ki=0.1,    # Add integral term
-                Kd=0.05,   # Add derivative term
+                Kp=10000.0, # 
+                Ki=0.0,    # Add integral term 0.01
+                Kd=0.00,   # Add derivative term 0.05
                 setpoint=0,
                 output_limits=(-2500000, 2500000) # must be adjusted!
             )
@@ -70,15 +71,17 @@ class MotorControlSystem:
         if line.startswith("ALL_POS"):
             p = line.split()
             if len(p) == 5:
-                for i in range(1, 5): self.current_steps[i] = int(p[i])
+                vals = [int(v) for v in p[1:5]]
+                self.current_steps[:] = vals
+                print(f"Feedback Updated: {self.current_steps}")
 
     def run_PID_vel_control_in_steps(self, target_steps):
         for m in range(1, 5):
             # Update setpoint (this happens every frame, totally fine!)
-            self.pid_controllers[m].setpoint = target_steps[m]
+            self.pid_controllers[m].setpoint = target_steps[m-1]
             
             # PID computes control output based on current position
-            vel = int(self.pid_controllers[m](self.current_steps[m]))
+            vel = int(self.pid_controllers[m](self.current_steps[m-1]))
             
             if abs(vel) >= 1:
                 self.ser.write(f"SET_VEL {m} {vel}\n".encode())
@@ -86,6 +89,16 @@ class MotorControlSystem:
                 self.ser.write(f"SET_VEL {m} 0\n".encode())
 
 
+    def run_direct_pos_control(self, target_steps):
+        for m in range(1, 5):
+            # Direct position control: compute velocity towards target
+            self.ser.write(f"SET_POS {m} {target_steps[m-1]}\n".encode())
+
+
+    def reset_motors(self):
+        for m in range(1, 5):
+            self.ser.write(f"RESET_POS {m} 0\n".encode())
+        self.current_steps = [0, 0, 0, 0]
 
     def run_PID_vel_control_in_degs_mm_via_Tic(self, dist_current_targets): # dist [X_mm, Y_mm, Z_mm, A_deg, B_deg_ C_deg], X = Catheter, Z = GW, Y not in use atm
         self.update_feedback()
@@ -212,6 +225,65 @@ class MotorControlSystem:
         if m in self.selected: self.selected.remove(m)
         else: self.selected.append(m)
 
+    def main_pos_control_with_pid_test(self):
+        print("Starting Position Control Test...")
+        self.reset_motors()
+        print("Motors Reset to 0.")
+
+        while True: 
+            print("Moving to positions: 100, 100, 100, 100")
+            self.run_PID_vel_control_in_steps([100, 100, 100, 100])
+            #time.sleep(2)
+            self.update_feedback()
+
+            self.run_PID_vel_control_in_steps([0, 0, 0, 0])
+            print("Moving to positions: 0, 0, 0, 0")
+            time.sleep(5)
+            self.update_feedback()
+
+            self.run_PID_vel_control_in_steps([200, 200, 200, 200])
+            print("Moving to positions: 200, 200, 200, 200")
+            time.sleep(2)
+            self.update_feedback()
+
+            self.reset_motors()
+            print("Motors Reset to 0.")
+            self.update_feedback()
+
+            
+
+    def main_pos_control(self):
+        print("Starting Position Control Test...")
+        self.reset_motors()
+        print("Motors Reset to 0.")
+        self.update_feedback()
+        while True: # Problem, if time sleep is not long enough, target is not reached and the final target is off! Thats why pid is rquired
+                print("Moving to positions: 100, 100, 100, 100")
+                self.run_direct_pos_control([100, 100, 100, 100])
+                time.sleep(2)
+                self.update_feedback()
+
+                self.run_direct_pos_control([0, 0, 0, 0])
+                print("Moving to positions: 0, 0, 0, 0")
+                time.sleep(2)
+                self.update_feedback()
+
+                self.run_direct_pos_control([200, 200, 200, 200])
+                print("Moving to positions: 200, 200, 200, 200")
+                time.sleep(2)
+                self.update_feedback()
+
+                self.reset_motors()
+                print("Motors Reset to 0.")
+                self.update_feedback()
+
+
+
+           
+
+
 if __name__ == "__main__":
     app = MotorControlSystem()
-    app.run()
+    app.main_pos_control_with_pid_test()
+    #app.run()
+    #app.main_pos_control()

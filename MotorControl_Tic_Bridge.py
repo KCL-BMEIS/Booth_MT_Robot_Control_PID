@@ -4,17 +4,18 @@ import sys
 import time
 from typing import Dict, List, Optional
 
-DEFAULT_PORT = "COM5"        # change to your Arduino port
+DEFAULT_PORT = "COM10"        # change to your Arduino port
 DEFAULT_BAUD = 115200
 
 class TicBridge:
     """Serial bridge for two-motor Tic controller: send targets and read telemetry."""
 
-    def __init__(self, port: str, baud: int = DEFAULT_BAUD, timeout: float = 1.0) -> None:
+    def __init__(self, port: str, baud: int = DEFAULT_BAUD, timeout: float = 1.0, motor_count: int = 4) -> None:
         self.port = port
         self.baud = baud
         self.timeout = timeout
         self.ser: Optional[serial.Serial] = None
+        self.motor_count = motor_count
         # Live telemetry attributes (updated on successful read)
         self.pos: List[int] = []
         self.target: List[int] = []
@@ -52,14 +53,27 @@ class TicBridge:
             "vel": to_ints("vel"),
         }
 
-    def send_targets(self, a: int, b: int) -> None:
+    def send_targets(self, *targets: int) -> None:
         if not self.ser:
             raise RuntimeError("Serial not open. Call open() or use context manager.")
-        msg = f"SET:{a},{b}\n".encode("ascii")
+        # Allow list/tuple as a single argument
+        if len(targets) == 1 and isinstance(targets[0], (list, tuple)):
+            targets = tuple(int(x) for x in targets[0])
+        if len(targets) == 0:
+            raise ValueError("send_targets requires at least one target value")
+
+        # If only one target is provided, apply it to all motors
+        targets_list = list(targets)
+        if len(targets_list) == 1:
+            targets_list = targets_list * self.motor_count
+        elif len(targets_list) != self.motor_count:
+            raise ValueError(f"Expected 1 or {self.motor_count} targets, got {len(targets_list)}")
+
+        msg = ("SET:" + ",".join(str(t) for t in targets_list) + "\n").encode("ascii")
         self.ser.write(msg)
         self.ser.flush()
         # Cache targets locally; Arduino telemetry does not include target
-        self.target = [a, b]
+        self.target = targets_list
 
     def send_reset(self) -> None:
         """Send RESET command to halt and reset all motors to position 0."""
@@ -69,7 +83,7 @@ class TicBridge:
         self.ser.write(msg)
         self.ser.flush()
         # Clear cached target after reset
-        self.target = [0, 0]
+        self.target = [0] * self.motor_count
 
     def readline(self) -> Optional[str]:
         if not self.ser:
@@ -96,6 +110,13 @@ class TicBridge:
             # Update live attributes
             self.pos = data.get("pos", [])
             self.vel = data.get("vel", [])
+            if self.pos:
+                self.motor_count = len(self.pos)
+                if len(self.target) != self.motor_count:
+                    # Keep existing targets when known; pad/truncate to match motor count
+                    padded = list(self.target[:self.motor_count])
+                    padded += [0] * (self.motor_count - len(padded))
+                    self.target = padded
             # Update derived flag: all pos equal target
             self.target_reached = (
                 len(self.pos) == len(self.target) and
@@ -113,31 +134,33 @@ class TicBridge:
     def set_target(self, target: int, motor: Optional[int] = None) -> None:
         """
         Set targets using single value.
-        - If motor is None: set both motors to the same target.
-        - If motor is 0 or 1: set only that motor, keeping the other at its current cached target (or 0 if unknown).
+        - If motor is None: set all motors to the same target.
+        - If motor is specified: set only that motor, keeping others at their current cached targets (or 0 if unknown).
         """
         if motor is None:
-            self.send_targets(target, target)
+            self.send_targets([target] * self.motor_count)
             return
-        if motor not in (0, 1):
-            raise ValueError("motor must be 0 or 1 for two-motor setup")
-        other = 0
-        if self.target and len(self.target) == 2:
-            other = self.target[1 - motor]
-        a, b = (target, other) if motor == 0 else (other, target)
-        self.send_targets(a, b)
+        if motor < 0 or motor >= self.motor_count:
+            raise ValueError(f"motor must be between 0 and {self.motor_count - 1}")
+
+        current = list(self.target)
+        if len(current) != self.motor_count:
+            current = ([0] * self.motor_count)
+        current[motor] = target
+        self.send_targets(current)
 
 def main():
-    ap = argparse.ArgumentParser(description="Tic bridge: telemetry + target commands (two motors)")
-    ap.add_argument("--port", default=DEFAULT_PORT, help="Serial port (e.g., COM5)")
+    ap = argparse.ArgumentParser(description="Tic bridge: telemetry + target commands for multiple motors")
+    ap.add_argument("--port", default=DEFAULT_PORT, help="Serial port (e.g., COM10)")
     ap.add_argument("--baud", type=int, default=DEFAULT_BAUD, help="Baud rate")
-    ap.add_argument("--set", help="Send targets 'a,b' for two motors (e.g., 400,200)")
+    ap.add_argument("--motors", type=int, default=4, help="Number of motors (targets per SET)")
+    ap.add_argument("--set", help="Send targets as comma list for all motors (e.g., 400,200,0,0)")
     ap.add_argument("--reset", action="store_true", help="Send reset command to halt and zero all motors")
     args = ap.parse_args()
 
     try:
-        with TicBridge(args.port, args.baud) as bridge:
-            print(f"Connected on {args.port} @ {args.baud}")
+        with TicBridge(args.port, args.baud, motor_count=args.motors) as bridge:
+            print(f"Connected on {args.port} @ {args.baud} for {bridge.motor_count} motors")
 
             if args.reset:
                 print("Sending reset...")
@@ -146,13 +169,16 @@ def main():
 
             if args.set:
                 try:
-                    a_str, b_str = [s.strip() for s in args.set.split(",", 1)]
-                    a, b = int(a_str), int(b_str)
+                    raw_vals = [s.strip() for s in args.set.split(",")]
+                    values = [int(v) for v in raw_vals if v != ""]
                 except Exception:
-                    print("--set requires two comma-separated integers, e.g., 400,200", file=sys.stderr)
+                    print("--set requires comma-separated integers, e.g., 400,200,0,0", file=sys.stderr)
                     sys.exit(2)
-                print(f"Sending targets: {a},{b}")
-                bridge.send_targets(a, b)
+                if len(values) not in (1, bridge.motor_count):
+                    print(f"--set expects 1 or {bridge.motor_count} values", file=sys.stderr)
+                    sys.exit(2)
+                print(f"Sending targets: {','.join(str(v) for v in values)}")
+                bridge.send_targets(values)
                 time.sleep(0.1)  # allow Arduino to process and ACK in telemetry
 
             while True:
@@ -167,15 +193,22 @@ def main():
         print("\nExiting...")
 
 def main_mini():
-    with TicBridge("COM5", 115200) as bridge:
-        if bridge.update():
-            print(bridge.pos, bridge.vel)
+    print("Starting Tic Bridge...")
+    while True:
+        print("loop is running ...")
+        
+        with TicBridge("COM10", 115200) as bridge:
+            if bridge.update():
+                print("Updated telemetry:")
+                print(bridge.pos, bridge.vel)
 
-        bridge.set_target(400) # set both moors
-        bridge.send_reset() # homing?
-        # Microstps input!
+            bridge.set_target(200, motor=3)
+            time.sleep(1.5)
+            bridge.set_target(0, motor=3)
+                #bridge.send_reset() # homing?
+            # Microstps input!
 
 # missing;: endstops, homing, etc.
 
 if __name__ == "__main__":
-    main()
+    main_mini()
