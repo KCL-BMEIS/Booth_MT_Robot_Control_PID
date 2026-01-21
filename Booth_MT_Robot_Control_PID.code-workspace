@@ -1,0 +1,12 @@
+{
+	"folders": [
+		{
+			"path": "."
+		},
+		{
+			"name": "Arduino_Tik_Motrodriver_Controller",
+			"path": "../../PlatformIO/Projects/Arduino_Tik_Motrodriver_Controller"
+		}
+	],
+	"settings": {}
+}
